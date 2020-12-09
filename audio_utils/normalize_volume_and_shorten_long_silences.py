@@ -1,0 +1,123 @@
+from scipy.ndimage.morphology import binary_dilation
+from pathlib import Path
+from typing import Optional, Union
+import numpy as np
+import webrtcvad
+import librosa
+import struct
+import soundfile as sf
+
+int16_max = (2 ** 15) - 1
+
+# Audio
+sampling_rate = 16000
+
+# Voice Activation Detection
+# Window size of the VAD. Must be either 10, 20 or 30 milliseconds.
+# This sets the granularity of the VAD. Should not need to be changed.
+vad_window_length = 30  # In milliseconds
+# Number of frames to average together when performing the moving average smoothing.
+# The larger this value, the larger the VAD variations must be to not get smoothed out.
+vad_moving_average_width = 8
+# Maximum number of consecutive silent frames a segment can have.
+vad_max_silence_length = 6
+
+# Audio volume normalization
+audio_norm_target_dBFS = -30
+
+
+def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray], source_sr: Optional[int] = None):
+    """
+    Applies preprocessing operations to a waveform either on disk or in memory such that  
+    The waveform will be resampled to match the data hyperparameters.
+
+    :param fpath_or_wav: either a filepath to an audio file (many extensions are supported, not 
+    just .wav), either the waveform as a numpy array of floats.
+    :param source_sr: if passing an audio waveform, the sampling rate of the waveform before 
+    preprocessing. After preprocessing, the waveform's sampling rate will match the data 
+    hyperparameters. If passing a filepath, the sampling rate will be automatically detected and 
+    this argument will be ignored.
+    """
+    # Load the wav from disk if needed
+    if isinstance(fpath_or_wav, str) or isinstance(fpath_or_wav, Path):
+        wav, source_sr = librosa.load(fpath_or_wav, sr=None)
+    else:
+        wav = fpath_or_wav
+
+    # Resample the wav
+    if source_sr is not None:
+        wav = librosa.resample(wav, source_sr, sampling_rate)
+
+    # Apply the preprocessing: normalize volume and shorten long silences
+    wav = normalize_volume(wav, audio_norm_target_dBFS, increase_only=True)
+    wav = trim_long_silences(wav)
+
+    return wav
+
+
+def trim_long_silences(wav):
+    """
+    Ensures that segments without voice in the waveform remain no longer than a 
+    threshold determined by the VAD parameters in params.py.
+
+    :param wav: the raw waveform as a numpy array of floats 
+    :return: the same waveform with silences trimmed away (length <= original wav length)
+    """
+    # Compute the voice detection window size
+    samples_per_window = (vad_window_length * sampling_rate) // 1000
+
+    # Trim the end of the audio to have a multiple of the window size
+    wav = wav[:len(wav) - (len(wav) % samples_per_window)]
+
+    # Convert the float waveform to 16-bit mono PCM
+    pcm_wave = struct.pack("%dh" % len(wav), *(np.round(wav * int16_max)).astype(np.int16))
+
+    # Perform voice activation detection
+    voice_flags = []
+    vad = webrtcvad.Vad(mode=3)
+    for window_start in range(0, len(wav), samples_per_window):
+        window_end = window_start + samples_per_window
+        voice_flags.append(vad.is_speech(pcm_wave[window_start * 2:window_end * 2],
+                                         sample_rate=sampling_rate))
+    voice_flags = np.array(voice_flags)
+
+    # Smooth the voice detection with a moving average
+    def moving_average(array, width):
+        array_padded = np.concatenate((np.zeros((width - 1) // 2), array, np.zeros(width // 2)))
+        ret = np.cumsum(array_padded, dtype=float)
+        ret[width:] = ret[width:] - ret[:-width]
+        return ret[width - 1:] / width
+
+    audio_mask = moving_average(voice_flags, vad_moving_average_width)
+    audio_mask = np.round(audio_mask).astype(np.bool)
+
+    # Dilate the voiced regions
+    audio_mask = binary_dilation(audio_mask, np.ones(vad_max_silence_length + 1))
+    audio_mask = np.repeat(audio_mask, samples_per_window)
+
+    return wav[audio_mask == True]
+
+
+def normalize_volume(wav, target_dBFS, increase_only=False, decrease_only=False):
+    if increase_only and decrease_only:
+        raise ValueError("Both increase only and decrease only are set")
+    rms = np.sqrt(np.mean((wav * int16_max) ** 2))
+    wave_dBFS = 20 * np.log10(rms / int16_max)
+    dBFS_change = target_dBFS - wave_dBFS
+    if dBFS_change < 0 and increase_only or dBFS_change > 0 and decrease_only:
+        return wav
+    return wav * (10 ** (dBFS_change / 20))
+
+
+def main():
+    wav, sr = librosa.load("/mnt/sda1/team_vocoder/data/biaobei/wave/100001.wav", sr=sampling_rate)
+    sf.write("1.wav", wav, sr)
+    print(len(wav))
+    
+    wav = preprocess_wav(wav)
+    sf.write("2.wav", wav, sr)
+    print(len(wav))
+
+
+if __name__ == "__main__":
+    main()
